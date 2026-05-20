@@ -232,11 +232,15 @@ func TestCreateImagePost_RecoversReplyByParentIDAndText(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// Two replies to the same parent, only one matches our text:
+			// Two replies to the same parent, only one matches our text.
+			// Note: PostExtendedFields requests `replied_to` (object), not
+			// `reply_to` (string), so the production API populates p.RepliedTo
+			// — mirror that shape here so the test exercises the same code
+			// path repliedToID() takes in production.
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
-                {"id":"earlier_reply","media_type":"IMAGE","is_reply":true,"reply_to":"parent_post_id","text":"earlier comment"},
-                {"id":"recovered_reply","media_type":"IMAGE","is_reply":true,"reply_to":"parent_post_id","text":"the comment we just sent"}
+                {"id":"earlier_reply","media_type":"IMAGE","is_reply":true,"replied_to":{"id":"parent_post_id"},"text":"earlier comment"},
+                {"id":"recovered_reply","media_type":"IMAGE","is_reply":true,"replied_to":{"id":"parent_post_id"},"text":"the comment we just sent"}
             ]}`))
 		default:
 			http.NotFound(w, r)
@@ -277,10 +281,12 @@ func TestCreateImagePost_BlankTextReplyFailsClosed(t *testing.T) {
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
 			// A prior reply to the same parent. Without a discriminator,
-			// matching by reply_to alone would WRONGLY return this post.
+			// matching by parent ID alone would WRONGLY return this post.
+			// Use `replied_to` (object) to match the production API shape
+			// returned for PostExtendedFields.
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
-                {"id":"prior_reply","media_type":"IMAGE","is_reply":true,"reply_to":"parent_post_id","text":""}
+                {"id":"prior_reply","media_type":"IMAGE","is_reply":true,"replied_to":{"id":"parent_post_id"},"text":""}
             ]}`))
 		default:
 			http.NotFound(w, r)
@@ -377,6 +383,50 @@ func TestCreateImagePost_RecoversRootByText(t *testing.T) {
 	}
 	if post == nil || post.ID != "matching_post" {
 		t.Fatalf("expected matching_post, got %#v", post)
+	}
+}
+
+// TestCreateTextPost_RecoversAfterCode10 covers the text-post recovery path
+// end-to-end. Specifically, it exercises makeTextMatcher's TopicTag arm: two
+// posts in the recovery window share the same text but only one has our
+// topic_tag, so the matcher must disambiguate on TopicTag rather than just
+// returning the first text-match it encounters.
+func TestCreateTextPost_RecoversAfterCode10(t *testing.T) {
+	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test"}}`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"id":"the_container"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
+			containerStatus(w, r)
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			// Two non-reply text posts with identical text — only the
+			// matching topic_tag should disambiguate them.
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"data":[
+                {"id":"wrong_topic_post","media_type":"TEXT_POST","is_reply":false,"text":"daily standup","topic_tag":"OtherTopic"},
+                {"id":"recovered_post","media_type":"TEXT_POST","is_reply":false,"text":"daily standup","topic_tag":"MorningStandup"}
+            ]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(handler))
+	post, err := client.CreateTextPost(context.Background(), &TextPostContent{
+		Text:     "daily standup",
+		TopicTag: "MorningStandup",
+	})
+	if err != nil {
+		t.Fatalf("expected text-post recovery to succeed, got: %v", err)
+	}
+	if post == nil || post.ID != "recovered_post" {
+		t.Fatalf("expected recovered_post, got %#v", post)
 	}
 }
 
