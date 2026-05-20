@@ -489,7 +489,11 @@ func (c *Client) DebugToken(ctx context.Context, inputToken string) (*DebugToken
 
 	resp, err := c.httpClient.GET("/debug_token", params, callerToken)
 	if err != nil {
-		return nil, NewNetworkError(0, "Failed to debug token", err.Error(), true)
+		// Propagate the typed error (e.g. AuthenticationError for code 190)
+		// so callers can inspect it correctly. Wrapping in a NetworkError with
+		// temporary=true was wrong: it hid the real type and made auth errors
+		// appear retryable.
+		return nil, fmt.Errorf("Failed to debug token - %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {

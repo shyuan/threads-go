@@ -315,8 +315,15 @@ func (h *HTTPClient) createErrorFromResponse(resp *Response) error {
 		details = details[:500] + "..."
 	}
 
-	// Create specific error types based on status code
+	// API-level auth codes take priority over HTTP status. Meta returns 5xx
+	// for token failures on some endpoints (e.g. /debug_token returns HTTP 500
+	// for error 190), which would otherwise be misclassified as retryable 5xx.
 	var resultErr error
+	if isAuthErrorCode(errorCode) {
+		authErr := NewAuthenticationError(errorCode, message, details)
+		setErrorMetadata(authErr, false, resp.StatusCode, apiErr.Error.ErrorSubcode)
+		return authErr
+	}
 	switch resp.StatusCode {
 	case 401, 403:
 		resultErr = NewAuthenticationError(errorCode, message, details)
@@ -351,6 +358,20 @@ func (h *HTTPClient) createErrorFromResponse(resp *Response) error {
 	setErrorMetadata(resultErr, isTransient, resp.StatusCode, apiErr.Error.ErrorSubcode)
 
 	return resultErr
+}
+
+// isAuthErrorCode reports whether code is a well-known Meta/Threads top-level
+// auth error that should always map to AuthenticationError, regardless of HTTP
+// status. Meta returns 5xx for these on some endpoints (e.g. /debug_token).
+// Subcodes (463 = token expired, 467 = missing permissions) nest under 190
+// and are handled by the caller via setErrorMetadata.
+func isAuthErrorCode(code int) bool {
+	switch code {
+	case 190, // Invalid/revoked/expired access token (subcodes 463, 467)
+		102: // Session invalidated / login required
+		return true
+	}
+	return false
 }
 
 // wrapNetworkError wraps network errors with appropriate error types.
