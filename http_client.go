@@ -374,6 +374,28 @@ func isAuthErrorCode(code int) bool {
 	return false
 }
 
+// isNonRetryablePermanentErrorCode reports whether the given Meta error code
+// is a permanent failure that won't be fixed by retrying. Meta returns HTTP
+// 5xx for these on some endpoints (notably /threads_publish), which would
+// otherwise be misclassified as a transient 5xx and retried — wasting API
+// quota that's counted per attempt.
+//
+// Auth codes (190, 102) are deliberately not listed here; they go through the
+// IsAuthenticationError() short-circuit at the top of isRetryableError.
+func isNonRetryablePermanentErrorCode(code int) bool {
+	switch code {
+	case 10:
+		// GraphMethodException — "Application does not have permission for
+		// this action". Meta returns this from /threads_publish for some
+		// app/permission configurations; per the API troubleshooting docs
+		// the publish may actually have succeeded even when this is
+		// returned, so callers can recover by checking container status.
+		// Retrying the publish never helps and burns publishing quota.
+		return true
+	}
+	return false
+}
+
 // wrapNetworkError wraps network errors with appropriate error types.
 // The original error is preserved as the Cause, so errors.Is/errors.As
 // can inspect it (e.g., to detect context.Canceled).
@@ -417,6 +439,12 @@ func (h *HTTPClient) isRetryableError(err error) bool {
 	// Check base error for transient flag or 5xx HTTP status
 	baseErr := extractBaseError(err)
 	if baseErr != nil {
+		// Permanent error codes short-circuit the 5xx branch below. Meta
+		// returns 5xx for some non-transient API codes (e.g. code 10 from
+		// /threads_publish); without this check we'd retry and burn quota.
+		if isNonRetryablePermanentErrorCode(baseErr.Code) {
+			return false
+		}
 		if baseErr.IsTransient {
 			return true
 		}
