@@ -315,8 +315,15 @@ func (h *HTTPClient) createErrorFromResponse(resp *Response) error {
 		details = details[:500] + "..."
 	}
 
-	// Create specific error types based on status code
+	// API-level auth codes take priority over HTTP status. Meta returns 5xx
+	// for token failures on some endpoints (e.g. /debug_token returns HTTP 500
+	// for error 190), which would otherwise be misclassified as retryable 5xx.
 	var resultErr error
+	if isAuthErrorCode(errorCode) {
+		authErr := NewAuthenticationError(errorCode, message, details)
+		setErrorMetadata(authErr, false, resp.StatusCode, apiErr.Error.ErrorSubcode)
+		return authErr
+	}
 	switch resp.StatusCode {
 	case 401, 403:
 		resultErr = NewAuthenticationError(errorCode, message, details)
@@ -353,6 +360,20 @@ func (h *HTTPClient) createErrorFromResponse(resp *Response) error {
 	return resultErr
 }
 
+// isAuthErrorCode reports whether code is a well-known Meta/Threads top-level
+// auth error that should always map to AuthenticationError, regardless of HTTP
+// status. Meta returns 5xx for these on some endpoints (e.g. /debug_token).
+// Subcodes (463 = token expired, 467 = missing permissions) nest under 190
+// and are handled by the caller via setErrorMetadata.
+func isAuthErrorCode(code int) bool {
+	switch code {
+	case 190, // Invalid/revoked/expired access token (subcodes 463, 467)
+		102: // Session invalidated / login required
+		return true
+	}
+	return false
+}
+
 // wrapNetworkError wraps network errors with appropriate error types.
 // The original error is preserved as the Cause, so errors.Is/errors.As
 // can inspect it (e.g., to detect context.Canceled).
@@ -373,6 +394,15 @@ func (h *HTTPClient) wrapNetworkError(err error) error {
 
 // isRetryableError determines if an error should trigger a retry
 func (h *HTTPClient) isRetryableError(err error) bool {
+	// Authentication errors are never retryable — the token is invalid and
+	// no amount of retrying will fix it. Guard this before the status-code
+	// check below: setErrorMetadata stores the HTTP status (e.g. 500 from
+	// graph.threads.net) on AuthenticationError's embedded BaseError, so the
+	// HTTPStatusCode >= 500 branch would otherwise re-enable retries.
+	if IsAuthenticationError(err) {
+		return false
+	}
+
 	// Rate limit errors are retry-able
 	if IsRateLimitError(err) {
 		return true

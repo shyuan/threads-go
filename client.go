@@ -526,14 +526,44 @@ func NewClientWithToken(accessToken string, config *Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to set temporary token: %w", err)
 	}
 
-	// Validate and get accurate token information
-	debugResp, err := client.DebugToken(context.Background(), accessToken)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate token: %w", err)
+	// Validate and get accurate token information via debug_token. If that
+	// endpoint fails (graph.threads.net returns HTTP 500 for valid tokens on
+	// dev-mode apps), fall back to a /me call which reliably validates the
+	// token and returns the user ID needed to bootstrap TokenInfo.
+	debugResp, debugErr := client.DebugToken(context.Background(), accessToken)
+	if debugErr == nil {
+		if err := client.SetTokenFromDebugInfo(accessToken, debugResp); err != nil {
+			return nil, fmt.Errorf("failed to set token info: %w", err)
+		}
+		return client, nil
 	}
 
-	// Set accurate token information from debug response
-	if err := client.SetTokenFromDebugInfo(accessToken, debugResp); err != nil {
+	// debug_token failed — verify with /me as fallback. Call httpClient
+	// directly rather than TestAPICall (which is test-only infrastructure).
+	meResp, meErr := client.httpClient.GET("/v1.0/me", url.Values{"fields": {"id"}}, accessToken)
+	if meErr != nil {
+		return nil, fmt.Errorf("failed to validate token (debug_token: %v, /me: %w)", debugErr, meErr)
+	}
+
+	var me struct {
+		ID string `json:"id"`
+	}
+	if jsonErr := json.Unmarshal(meResp.Body, &me); jsonErr != nil {
+		return nil, fmt.Errorf("failed to parse /me response (debug_token also failed: %v): %w", debugErr, jsonErr)
+	}
+	if me.ID == "" {
+		return nil, fmt.Errorf("failed to validate token: %w", debugErr)
+	}
+
+	// /me succeeded — token is valid. Set token info with the user ID and a
+	// 60-day expiry (standard Threads long-lived token lifetime).
+	if err := client.SetTokenInfo(&TokenInfo{
+		AccessToken: accessToken,
+		TokenType:   "Bearer",
+		ExpiresAt:   time.Now().Add(60 * 24 * time.Hour),
+		UserID:      me.ID,
+		CreatedAt:   time.Now(),
+	}); err != nil {
 		return nil, fmt.Errorf("failed to set token info: %w", err)
 	}
 
