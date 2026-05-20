@@ -46,10 +46,7 @@ func (c *Client) CreateTextPost(ctx context.Context, content *TextPostContent) (
 	publishStart := time.Now()
 	post, err := c.publishContainer(ctx, containerID)
 	if err != nil {
-		if recovered, recErr := c.recoverFromPublishError(ctx, containerID, publishStart, err, makeTextMatcher(content)); recErr == nil {
-			return recovered, nil
-		}
-		return nil, fmt.Errorf("failed to publish text post: %w", err)
+		return c.recoverOrWrap(ctx, containerID, publishStart, err, makeTextMatcher(content), "failed to publish text post: %w")
 	}
 
 	return post, nil
@@ -86,10 +83,7 @@ func (c *Client) CreateImagePost(ctx context.Context, content *ImagePostContent)
 	publishStart := time.Now()
 	post, err := c.publishContainer(ctx, containerID)
 	if err != nil {
-		if recovered, recErr := c.recoverFromPublishError(ctx, containerID, publishStart, err, makeImageMatcher(content)); recErr == nil {
-			return recovered, nil
-		}
-		return nil, fmt.Errorf("failed to publish image post: %w", err)
+		return c.recoverOrWrap(ctx, containerID, publishStart, err, makeImageMatcher(content), "failed to publish image post: %w")
 	}
 
 	return post, nil
@@ -126,10 +120,7 @@ func (c *Client) CreateVideoPost(ctx context.Context, content *VideoPostContent)
 	publishStart := time.Now()
 	post, err := c.publishContainer(ctx, containerID)
 	if err != nil {
-		if recovered, recErr := c.recoverFromPublishError(ctx, containerID, publishStart, err, makeVideoMatcher(content)); recErr == nil {
-			return recovered, nil
-		}
-		return nil, fmt.Errorf("failed to publish video post: %w", err)
+		return c.recoverOrWrap(ctx, containerID, publishStart, err, makeVideoMatcher(content), "failed to publish video post: %w")
 	}
 
 	return post, nil
@@ -206,10 +197,7 @@ func (c *Client) CreateCarouselPost(ctx context.Context, content *CarouselPostCo
 	publishStart := time.Now()
 	post, err := c.publishContainer(ctx, containerID)
 	if err != nil {
-		if recovered, recErr := c.recoverFromPublishError(ctx, containerID, publishStart, err, makeCarouselMatcher(content)); recErr == nil {
-			return recovered, nil
-		}
-		return nil, fmt.Errorf("failed to publish carousel post: %w", err)
+		return c.recoverOrWrap(ctx, containerID, publishStart, err, makeCarouselMatcher(content), "failed to publish carousel post: %w")
 	}
 
 	return post, nil

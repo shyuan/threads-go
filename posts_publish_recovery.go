@@ -73,6 +73,44 @@ func (c *Client) recoverFromPublishError(
 	return c.tryRecoverPublishedPost(ctx, containerID, publishStart, match)
 }
 
+// recoverOrWrap is the canonical post-publish-error glue for Create*Post:
+// it runs recovery, then turns the (recovered, recErr, publishErr) triple
+// into a single caller-facing return.
+//
+// Three outcomes:
+//
+//  1. Recovery succeeded → return the recovered post.
+//  2. Recovery was cut short by caller-context cancellation or deadline →
+//     propagate the ctx error verbatim. Callers (and any downstream
+//     classification, e.g. retry loops) rely on errors.Is(err, context.Xxx)
+//     to distinguish "the publish actually failed" from "we ran out of time
+//     during recovery"; swallowing the ctx error into the original publish
+//     error breaks that distinction.
+//  3. Recovery couldn't help (errPublishNotRecovered, a recovery-side HTTP
+//     error that isn't a context error, etc.) → surface the ORIGINAL
+//     publish error wrapped by wrapFmt. This is the case where the publish
+//     itself is what the caller needs to see.
+//
+// wrapFmt is a fmt.Errorf format string with a single %w verb, e.g.
+// "failed to publish carousel post: %w".
+func (c *Client) recoverOrWrap(
+	ctx context.Context,
+	containerID string,
+	publishStart time.Time,
+	publishErr error,
+	match publishMatcher,
+	wrapFmt string,
+) (*Post, error) {
+	recovered, recErr := c.recoverFromPublishError(ctx, containerID, publishStart, publishErr, match)
+	if recErr == nil {
+		return recovered, nil
+	}
+	if errors.Is(recErr, context.Canceled) || errors.Is(recErr, context.DeadlineExceeded) {
+		return nil, recErr
+	}
+	return nil, fmt.Errorf(wrapFmt, publishErr)
+}
+
 // tryRecoverPublishedPost implements the Meta-documented recovery flow for
 // /threads_publish calls that error out despite succeeding server-side:
 //

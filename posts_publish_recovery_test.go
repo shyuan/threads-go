@@ -15,12 +15,12 @@ import (
 // the production 1s-per-attempt wait. All recovery tests in this file
 // rely on this; running them with the default interval would add several
 // seconds of wall time per case.
+//
+// No restore needed: os.Exit terminates the process so any subsequent
+// statements would be dead code.
 func TestMain(m *testing.M) {
-	original := recoveryPollInterval
 	recoveryPollInterval = 5 * time.Millisecond
-	code := m.Run()
-	recoveryPollInterval = original
-	os.Exit(code)
+	os.Exit(m.Run())
 }
 
 // containerStatusHandler returns a GET handler for /{containerID} that:
@@ -645,6 +645,64 @@ func TestRecovery_NotTriggeredForNonCode10(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&threadsListCalls); got != 0 {
 		t.Errorf("recovery should not fire for code 100; /me/threads was queried %d times", got)
+	}
+}
+
+// TestRecovery_ContextCancellationPropagates verifies that if the caller's
+// context is cancelled (or deadline-exceeds) DURING recovery polling, the
+// caller-facing error is the context error — not the wrapped original
+// publish error. Downstream retry/classification code relies on
+// errors.Is(err, context.Canceled / DeadlineExceeded) to distinguish a
+// real publish failure from "we ran out of time during recovery."
+func TestRecovery_ContextCancellationPropagates(t *testing.T) {
+	// Hold poll interval long enough that the caller's short deadline
+	// fires while we're sleeping between polls. The default 5ms set in
+	// TestMain would race the deadline; override for this test only.
+	orig := recoveryPollInterval
+	recoveryPollInterval = 50 * time.Millisecond
+	t.Cleanup(func() { recoveryPollInterval = orig })
+
+	// Container stays FINISHED forever — polling never reaches PUBLISHED
+	// nor a terminal failure, so it WILL exhaust the budget. Caller's
+	// short deadline should fire well before we hit the budget.
+	containerStatus, _ := containerStatusHandler(maxRecoveryStatusPolls+5, "FINISHED")
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test"}}`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"id":"the_container"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
+			containerStatus(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(handler))
+
+	// 30ms deadline << poll interval. Recovery should sleep, see ctx
+	// done, and bail with ctx.Err().
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	_, err := client.CreateImagePost(ctx, &ImagePostContent{
+		Text:     "hello",
+		ImageURL: "https://example.com/img.jpg",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded to propagate; got %v (Is(DeadlineExceeded)=%v)",
+			err, errors.Is(err, context.DeadlineExceeded))
+	}
+	// And specifically NOT the wrapped publish error.
+	if strings.Contains(err.Error(), "failed to publish image post") {
+		t.Errorf("expected raw ctx error, got wrapped publish error: %v", err)
 	}
 }
 
