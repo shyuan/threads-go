@@ -719,6 +719,33 @@ func TestIsRetryableErrorWithTransientAPIError(t *testing.T) {
 	}
 }
 
+func TestIsRetryableError_Code10NotRetried(t *testing.T) {
+	// Meta returns HTTP 5xx from /threads_publish for some app/permission
+	// configurations with error code 10 (GraphMethodException). Without an
+	// explicit non-retryable override, the 5xx branch of isRetryableError
+	// would retry it — burning publishing quota for every cycle. Verify the
+	// override holds.
+	h := &HTTPClient{
+		logger:      &noopLogger{},
+		retryConfig: &RetryConfig{MaxRetries: 3, InitialDelay: time.Second, MaxDelay: time.Second, BackoffFactor: 2},
+	}
+
+	apiErr := NewAPIError(10, "Application does not have permission for this action", "details", "trace")
+	apiErr.HTTPStatusCode = 500
+
+	if h.isRetryableError(apiErr) {
+		t.Error("expected code 10 with HTTP 500 to be non-retryable; would burn publishing quota otherwise")
+	}
+
+	// Sanity: a different 5xx code should still retry, so we're not
+	// over-broadening the non-retryable list.
+	other5xx := NewAPIError(2, "Unexpected error", "details", "trace")
+	other5xx.HTTPStatusCode = 500
+	if !h.isRetryableError(other5xx) {
+		t.Error("expected a non-listed 5xx code to remain retryable")
+	}
+}
+
 func TestIsTransientErrorHelper(t *testing.T) {
 	transientErr := NewAPIError(2, "Unexpected error", "details", "trace")
 	transientErr.IsTransient = true
