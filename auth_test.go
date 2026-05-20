@@ -177,19 +177,34 @@ func TestRefreshToken_NoToken(t *testing.T) {
 }
 
 func TestDebugToken_Success(t *testing.T) {
-	client := testClient(t, jsonHandler(200, `{
-		"data": {
-			"type": "USER",
-			"application": "Test App",
-			"is_valid": true,
-			"expires_at": 1735689600,
-			"issued_at": 1735603200,
-			"user_id": "12345",
-			"scopes": ["threads_basic"]
-		}
-	}`))
+	const wantAppToken = "TH|test-client-id|test-client-secret"
+	const wantInputToken = "test-token"
 
-	resp, err := client.DebugToken(context.Background(), "test-token")
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("access_token"); got != wantAppToken {
+			t.Errorf("access_token: got %q, want %q (app-token shorthand required by Meta's /debug_token)", got, wantAppToken)
+		}
+		if got := r.URL.Query().Get("input_token"); got != wantInputToken {
+			t.Errorf("input_token: got %q, want %q", got, wantInputToken)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"type": "USER",
+				"application": "Test App",
+				"is_valid": true,
+				"expires_at": 1735689600,
+				"issued_at": 1735603200,
+				"user_id": "12345",
+				"scopes": ["threads_basic"]
+			}
+		}`))
+	})
+
+	client := testClient(t, handler)
+
+	resp, err := client.DebugToken(context.Background(), wantInputToken)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -198,6 +213,31 @@ func TestDebugToken_Success(t *testing.T) {
 	}
 	if resp.Data.UserID != "12345" {
 		t.Errorf("expected user ID 12345, got %s", resp.Data.UserID)
+	}
+}
+
+// When ClientID/ClientSecret are not configured, DebugToken must fall back to
+// the user access token as the caller. Covers the no-app-creds branch.
+func TestDebugToken_FallbackToUserTokenWithoutClientCreds(t *testing.T) {
+	const wantCallerToken = "test-access-token"
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("access_token"); got != wantCallerToken {
+			t.Errorf("access_token: got %q, want %q (must fall back to user token when no app creds)", got, wantCallerToken)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"data":{"type":"USER","is_valid":true,"expires_at":1735689600,"issued_at":1735603200,"user_id":"12345","scopes":["threads_basic"]}}`))
+	})
+
+	client := testClient(t, handler)
+	// NewClient rejects empty client creds, so blank them out post-construction
+	// to exercise the fallback branch in DebugToken.
+	client.config.ClientID = ""
+	client.config.ClientSecret = ""
+
+	if _, err := client.DebugToken(context.Background(), ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
