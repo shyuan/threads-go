@@ -1235,6 +1235,41 @@ func TestNewClientWithToken(t *testing.T) {
 		}
 	})
 
+	t.Run("debug_token 500 falls back to /me", func(t *testing.T) {
+		// graph.threads.net returns HTTP 500 for valid tokens on dev-mode apps;
+		// NewClientWithToken must fall back to /me and succeed.
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/debug_token" {
+				w.WriteHeader(500)
+				w.Write([]byte(`{"error":{"message":"Invalid OAuth 2.0 Access Token","code":190,"type":"THApiException","error_data":[]}}`))
+				return
+			}
+			// /v1.0/me fallback
+			w.WriteHeader(200)
+			w.Write([]byte(`{"id":"27258452443753298","username":"fiadocs"}`))
+		}))
+		defer ts.Close()
+
+		config := &Config{
+			ClientID:     "test-id",
+			ClientSecret: "test-secret",
+			RedirectURI:  "https://example.com/callback",
+			BaseURL:      ts.URL,
+		}
+
+		client, err := NewClientWithToken("valid-token", config)
+		if err != nil {
+			t.Fatalf("expected no error when /me succeeds, got: %v", err)
+		}
+		if !client.IsAuthenticated() {
+			t.Error("expected client to be authenticated")
+		}
+		if client.GetTokenInfo().UserID != "27258452443753298" {
+			t.Errorf("expected UserID 27258452443753298, got %s", client.GetTokenInfo().UserID)
+		}
+	})
+
 	t.Run("valid token with mock server", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
