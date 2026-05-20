@@ -4,27 +4,50 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
-// containerStatusHandler returns a GET handler for /{containerID} that
-// reports FINISHED for the first call (so waitForContainerReady can proceed)
-// and the supplied recovery status for every subsequent call. This mirrors
-// the real container lifecycle: a container is FINISHED before publish,
-// then PUBLISHED (or still FINISHED, on real failure) after.
-func containerStatusHandler(statusAfterPublish string) (http.HandlerFunc, *int32) {
+// TestMain shrinks recoveryPollInterval so polling-path tests don't pay
+// the production 1s-per-attempt wait. All recovery tests in this file
+// rely on this; running them with the default interval would add several
+// seconds of wall time per case.
+func TestMain(m *testing.M) {
+	original := recoveryPollInterval
+	recoveryPollInterval = 5 * time.Millisecond
+	code := m.Run()
+	recoveryPollInterval = original
+	os.Exit(code)
+}
+
+// containerStatusHandler returns a GET handler for /{containerID} that:
+//   - emits FINISHED for the first call (waitForContainerReady, pre-publish),
+//   - then emits FINISHED for `finishedRepeats` more calls (recovery polling
+//     observing FINISHED before the status row flips),
+//   - then emits `terminalStatus` for every subsequent call.
+//
+// Pass finishedRepeats=0 to flip to the terminal status immediately on the
+// first recovery-side read (the common "post got created promptly" case).
+// Pass finishedRepeats > maxRecoveryStatusPolls to exhaust the recovery
+// poll budget while staying FINISHED.
+func containerStatusHandler(finishedRepeats int, terminalStatus string) (http.HandlerFunc, *int32) {
 	var calls int32
 	h := func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&calls, 1)
+		n := int(atomic.AddInt32(&calls, 1))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		if n == 1 {
+		// Call 1 = waitForContainerReady (must see FINISHED to proceed).
+		// Calls 2..(1+finishedRepeats) = additional recovery polls that
+		// still see FINISHED.
+		// Calls after that = terminalStatus.
+		if n <= 1+finishedRepeats {
 			_, _ = w.Write([]byte(`{"id":"the_container","status":"FINISHED"}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"id":"the_container","status":"` + statusAfterPublish + `"}`))
+		_, _ = w.Write([]byte(`{"id":"the_container","status":"` + terminalStatus + `"}`))
 	}
 	return h, &calls
 }
@@ -32,20 +55,23 @@ func containerStatusHandler(statusAfterPublish string) (http.HandlerFunc, *int32
 // TestCreateCarouselPost_RecoversAfterCode10 verifies the documented Meta
 // quirk where /threads_publish returns HTTP 500 + code 10 even though the
 // carousel was actually published. After the failed publish, recovery should:
-//   - confirm container status is PUBLISHED,
-//   - locate the published post via /me/threads, matching by exact child
-//     container ID set,
+//   - confirm container status is PUBLISHED (polling-tolerant),
+//   - locate the published post via /me/threads using a content-based
+//     matcher (NOT the child container IDs we passed, which won't appear in
+//     the read-side `children` field — see makeCarouselMatcher's doc),
 //   - return that post as if the publish had succeeded.
+//
+// The mock returns child IDs of the form "published_child_*" to make the
+// container-vs-post-ID distinction explicit; a regression that re-introduces
+// children-ID set matching would fail to recover here.
 func TestCreateCarouselPost_RecoversAfterCode10(t *testing.T) {
 	var publishAttempts int32
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
 			atomic.AddInt32(&publishAttempts, 1)
-			// Mimic Meta: HTTP 500 with code 10 even though the publish
-			// will actually have been persisted server-side.
 			w.WriteHeader(500)
 			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test-trace"}}`))
 		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
@@ -60,12 +86,13 @@ func TestCreateCarouselPost_RecoversAfterCode10(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// Recovery's /me/threads lookup. Include the matching post plus
-			// an unrelated one to verify the matcher disambiguates.
+			// Production-shape mock: children carry POST IDs of the
+			// individual published children, not the container IDs we
+			// passed in CreateCarouselPost.Children. We must match by
+			// content + count, not by ID set equality.
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
-                {"id":"other_post","media_type":"CAROUSEL_ALBUM","children":{"data":[{"id":"unrelated_a"},{"id":"unrelated_b"}]}},
-                {"id":"recovered_post","media_type":"CAROUSEL_ALBUM","children":{"data":[{"id":"child_1"},{"id":"child_2"}]}}
+                {"id":"recovered_post","media_type":"CAROUSEL_ALBUM","text":"my carousel","topic_tag":"F1Threads","is_reply":false,"children":{"data":[{"id":"published_child_a"},{"id":"published_child_b"}]}}
             ]}`))
 		default:
 			http.NotFound(w, r)
@@ -74,8 +101,9 @@ func TestCreateCarouselPost_RecoversAfterCode10(t *testing.T) {
 
 	client := testClient(t, http.HandlerFunc(handler))
 	post, err := client.CreateCarouselPost(context.Background(), &CarouselPostContent{
-		Text:     "carousel",
+		Text:     "my carousel",
 		Children: []string{"child_1", "child_2"},
+		TopicTag: "F1Threads",
 	})
 	if err != nil {
 		t.Fatalf("expected recovery to succeed, got error: %v", err)
@@ -88,14 +116,13 @@ func TestCreateCarouselPost_RecoversAfterCode10(t *testing.T) {
 	}
 }
 
-// TestCreateCarouselPost_NoRecoveryWhenContainerNotPublished verifies that
-// when the container is NOT in PUBLISHED state, we surface the original
-// publish error instead of fabricating a recovery. This protects against
-// returning the wrong post when Meta really did reject the publish.
-func TestCreateCarouselPost_NoRecoveryWhenContainerNotPublished(t *testing.T) {
-	// Container stays FINISHED for both the wait-for-ready poll and the
-	// recovery status check — the publish really did fail.
-	containerStatus, _ := containerStatusHandler("FINISHED")
+// TestCreateCarouselPost_NoRecoveryWhenContainerNeverPublishes verifies that
+// when the container is NEVER seen in PUBLISHED state (stays FINISHED past
+// the poll budget), recovery exhausts polls and surfaces the original
+// publish error.
+func TestCreateCarouselPost_NoRecoveryWhenContainerNeverPublishes(t *testing.T) {
+	// Stay FINISHED for far more attempts than the poll budget.
+	containerStatus, _ := containerStatusHandler(maxRecoveryStatusPolls+2, "FINISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -121,20 +148,18 @@ func TestCreateCarouselPost_NoRecoveryWhenContainerNotPublished(t *testing.T) {
 		Children: []string{"child_1", "child_2"},
 	})
 	if err == nil {
-		t.Fatal("expected the original publish error to surface when container is not PUBLISHED")
+		t.Fatal("expected the original publish error to surface when container never reaches PUBLISHED")
 	}
-	// BaseError.Error() formats as "threads api error 10 (api_error): ...";
-	// match that prefix rather than a more fragile substring.
 	if !strings.Contains(err.Error(), "threads api error 10") {
 		t.Errorf("expected wrapped code 10 error, got: %v", err)
 	}
 }
 
-// TestCreateCarouselPost_NoRecoveryWhenNoMatch verifies we don't blindly
-// pick "the newest post since T0". If no post in the recovery window has
-// our child container IDs, recovery fails closed.
-func TestCreateCarouselPost_NoRecoveryWhenNoMatch(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+// TestCreateCarouselPost_NoRecoveryWhenContainerErrored confirms that a
+// terminal failure status (ERROR) short-circuits the status-polling loop
+// rather than burning the full poll budget.
+func TestCreateCarouselPost_NoRecoveryWhenContainerErrored(t *testing.T) {
+	containerStatus, statusCalls := containerStatusHandler(0, "ERROR")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -149,14 +174,6 @@ func TestCreateCarouselPost_NoRecoveryWhenNoMatch(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":"child","status":"FINISHED"}`))
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
-		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// Recent posts exist but none have our children — must NOT
-			// accidentally pick the newest unrelated one.
-			w.WriteHeader(200)
-			_, _ = w.Write([]byte(`{"data":[
-                {"id":"unrelated_a","media_type":"CAROUSEL_ALBUM","children":{"data":[{"id":"x"},{"id":"y"}]}},
-                {"id":"unrelated_b","media_type":"IMAGE"}
-            ]}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -168,15 +185,114 @@ func TestCreateCarouselPost_NoRecoveryWhenNoMatch(t *testing.T) {
 		Children: []string{"child_1", "child_2"},
 	})
 	if err == nil {
-		t.Fatal("expected error when no post matches our child container IDs")
+		t.Fatal("expected the original publish error to surface for ERROR container status")
+	}
+	// 1 call from waitForContainerReady + 1 call from recovery (saw ERROR,
+	// short-circuited). No additional polls.
+	if got := atomic.LoadInt32(statusCalls); got > 2 {
+		t.Errorf("recovery should short-circuit on terminal ERROR; status was queried %d times", got)
 	}
 }
 
-// TestCreateCarouselPost_FailClosedOnMultipleMatches: the matcher is supposed
-// to be unique per request, so >1 match means we'd be guessing. Confirm we
-// fail closed in that case rather than returning the wrong post.
+// TestRecovery_PollsContainerStatus exercises the bounded-polling path:
+// status reads return FINISHED a few times before flipping to PUBLISHED.
+// Without this loop, a race between Meta returning code 10 and the
+// container status row flipping would mis-classify a successful publish.
+func TestRecovery_PollsContainerStatus(t *testing.T) {
+	// 2 recovery-side FINISHED reads, then PUBLISHED.
+	containerStatus, _ := containerStatusHandler(2, "PUBLISHED")
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test"}}`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"id":"the_container"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
+			containerStatus(w, r)
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"data":[
+                {"id":"recovered_post","media_type":"IMAGE","is_reply":false,"text":"the caption","topic_tag":"Hello"}
+            ]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(handler))
+	post, err := client.CreateImagePost(context.Background(), &ImagePostContent{
+		Text:     "the caption",
+		ImageURL: "https://example.com/img.jpg",
+		TopicTag: "Hello",
+	})
+	if err != nil {
+		t.Fatalf("expected recovery to succeed after status polling, got: %v", err)
+	}
+	if post.ID != "recovered_post" {
+		t.Fatalf("expected recovered_post, got %s", post.ID)
+	}
+}
+
+// TestRecovery_PollsUserPostsList exercises the list-polling path: the
+// first /me/threads call returns no match (index lag), a subsequent call
+// returns the published post. This is the failure mode observed in
+// production with v1.9.3 — recovery was correct, but a single immediate
+// list read missed the post.
+func TestRecovery_PollsUserPostsList(t *testing.T) {
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
+	var listCalls int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test"}}`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"id":"the_container"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
+			containerStatus(w, r)
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			n := atomic.AddInt32(&listCalls, 1)
+			if n == 1 {
+				// First read: index hasn't seen the post yet.
+				_, _ = w.Write([]byte(`{"data":[]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":[
+                {"id":"recovered_post","media_type":"IMAGE","is_reply":false,"text":"the caption","topic_tag":"Hello"}
+            ]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(handler))
+	post, err := client.CreateImagePost(context.Background(), &ImagePostContent{
+		Text:     "the caption",
+		ImageURL: "https://example.com/img.jpg",
+		TopicTag: "Hello",
+	})
+	if err != nil {
+		t.Fatalf("expected recovery after list-polling to succeed, got: %v", err)
+	}
+	if post.ID != "recovered_post" {
+		t.Fatalf("expected recovered_post, got %s", post.ID)
+	}
+	if got := atomic.LoadInt32(&listCalls); got < 2 {
+		t.Errorf("expected at least 2 list calls (first empty, second matched), got %d", got)
+	}
+}
+
+// TestCreateCarouselPost_FailClosedOnMultipleMatches: matchers must be
+// unique per request, so >1 match means we'd be guessing. Confirm we fail
+// closed rather than returning the wrong post.
 func TestCreateCarouselPost_FailClosedOnMultipleMatches(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -192,13 +308,13 @@ func TestCreateCarouselPost_FailClosedOnMultipleMatches(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// Two posts share the same child container IDs — should not
-			// happen in practice (Meta mints fresh IDs) but exercise the
-			// fail-closed branch defensively.
+			// Two same-text, same-count, same-tag carousel posts.
+			// Shouldn't happen in practice — exercise the fail-closed
+			// branch defensively.
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
-                {"id":"match_a","media_type":"CAROUSEL_ALBUM","children":{"data":[{"id":"child_1"},{"id":"child_2"}]}},
-                {"id":"match_b","media_type":"CAROUSEL_ALBUM","children":{"data":[{"id":"child_1"},{"id":"child_2"}]}}
+                {"id":"match_a","media_type":"CAROUSEL_ALBUM","text":"carousel","topic_tag":"T","is_reply":false,"children":{"data":[{"id":"a"},{"id":"b"}]}},
+                {"id":"match_b","media_type":"CAROUSEL_ALBUM","text":"carousel","topic_tag":"T","is_reply":false,"children":{"data":[{"id":"c"},{"id":"d"}]}}
             ]}`))
 		default:
 			http.NotFound(w, r)
@@ -209,6 +325,7 @@ func TestCreateCarouselPost_FailClosedOnMultipleMatches(t *testing.T) {
 	_, err := client.CreateCarouselPost(context.Background(), &CarouselPostContent{
 		Text:     "carousel",
 		Children: []string{"child_1", "child_2"},
+		TopicTag: "T",
 	})
 	if err == nil {
 		t.Fatal("expected error on ambiguous match (>1)")
@@ -219,7 +336,7 @@ func TestCreateCarouselPost_FailClosedOnMultipleMatches(t *testing.T) {
 // reply case where the caller supplies non-empty text. Parent ID alone is
 // not unique across replies, so the matcher also requires text equality.
 func TestCreateImagePost_RecoversReplyByParentIDAndText(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -232,11 +349,8 @@ func TestCreateImagePost_RecoversReplyByParentIDAndText(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// Two replies to the same parent, only one matches our text.
-			// Note: PostExtendedFields requests `replied_to` (object), not
-			// `reply_to` (string), so the production API populates p.RepliedTo
-			// — mirror that shape here so the test exercises the same code
-			// path repliedToID() takes in production.
+			// Production-shape mock: PostExtendedFields returns `replied_to`
+			// (object), not `reply_to` (string).
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
                 {"id":"earlier_reply","media_type":"IMAGE","is_reply":true,"replied_to":{"id":"parent_post_id"},"text":"earlier comment"},
@@ -261,13 +375,11 @@ func TestCreateImagePost_RecoversReplyByParentIDAndText(t *testing.T) {
 	}
 }
 
-// TestCreateImagePost_BlankTextReplyFailsClosed verifies that an image reply
-// with no text and no quoted post — which has no unique discriminator beyond
-// parent ID — does NOT recover, even if a prior reply to the same parent is
-// visible in the recovery window. This protects callers (e.g. chained reply
-// flows) from threading subsequent work off the wrong post ID.
+// TestCreateImagePost_BlankTextReplyFailsClosed: blank-text non-quote
+// replies have no unique discriminator beyond parent ID; recovery must
+// not guess.
 func TestCreateImagePost_BlankTextReplyFailsClosed(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -280,10 +392,6 @@ func TestCreateImagePost_BlankTextReplyFailsClosed(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// A prior reply to the same parent. Without a discriminator,
-			// matching by parent ID alone would WRONGLY return this post.
-			// Use `replied_to` (object) to match the production API shape
-			// returned for PostExtendedFields.
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
                 {"id":"prior_reply","media_type":"IMAGE","is_reply":true,"replied_to":{"id":"parent_post_id"},"text":""}
@@ -297,21 +405,18 @@ func TestCreateImagePost_BlankTextReplyFailsClosed(t *testing.T) {
 	_, err := client.CreateImagePost(context.Background(), &ImagePostContent{
 		ImageURL: "https://example.com/img.jpg",
 		ReplyTo:  "parent_post_id",
-		// Text and QuotedPostID both empty — no unique signal.
 	})
 	if err == nil {
-		t.Fatal("expected fail-closed for blank-text non-quote image reply (would otherwise return prior_reply)")
-	}
-	if !strings.Contains(err.Error(), "threads api error 10") {
-		t.Errorf("expected original code 10 error to surface, got: %v", err)
+		t.Fatal("expected fail-closed for blank-text non-quote image reply")
 	}
 }
 
-// TestCreateImagePost_QuotePostNotMistakenForRegular verifies the quote-state
-// gate: if the caller asked for a non-quote image but a same-text quote post
-// shows up in the recovery window, the matcher must NOT pick it.
-func TestCreateImagePost_QuotePostNotMistakenForRegular(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+// TestCreateImagePost_BlankTextBlankTagRootFailsClosed: a non-reply
+// image-only post with empty text AND empty topic_tag has no discriminator
+// — matching by media_type + !is_reply alone would accept any prior
+// unrelated image. Recovery must fail closed.
+func TestCreateImagePost_BlankTextBlankTagRootFailsClosed(t *testing.T) {
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -324,8 +429,46 @@ func TestCreateImagePost_QuotePostNotMistakenForRegular(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// Same text, but it's a quote post — we asked for a regular
-			// post, so it must NOT match.
+			// A prior unrelated image post in the recovery window. Without
+			// the discriminator rule, matching by media_type+!is_reply
+			// alone would return this and the bot could chain off the
+			// wrong post ID.
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"data":[
+                {"id":"prior_image","media_type":"IMAGE","is_reply":false,"text":"","topic_tag":""}
+            ]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(handler))
+	_, err := client.CreateImagePost(context.Background(), &ImagePostContent{
+		ImageURL: "https://example.com/img.jpg",
+		// Text, TopicTag, QuotedPostID all empty — no discriminator.
+	})
+	if err == nil {
+		t.Fatal("expected fail-closed for blank-text + blank-tag image root (no unique signal)")
+	}
+}
+
+// TestCreateImagePost_QuotePostNotMistakenForRegular verifies the quote-state
+// gate: if the caller asked for a non-quote image but a same-text quote post
+// shows up in the recovery window, the matcher must NOT pick it.
+func TestCreateImagePost_QuotePostNotMistakenForRegular(t *testing.T) {
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test"}}`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"id":"the_container"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
+			containerStatus(w, r)
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
                 {"id":"a_quote_post","media_type":"IMAGE","is_reply":false,"text":"hello","is_quote_post":true,"quoted_post":{"id":"some_other_post"}}
@@ -339,7 +482,6 @@ func TestCreateImagePost_QuotePostNotMistakenForRegular(t *testing.T) {
 	_, err := client.CreateImagePost(context.Background(), &ImagePostContent{
 		Text:     "hello",
 		ImageURL: "https://example.com/img.jpg",
-		// No QuotedPostID → must only match non-quote posts.
 	})
 	if err == nil {
 		t.Fatal("expected fail-closed when only candidate is a quote post and caller asked for non-quote")
@@ -348,10 +490,9 @@ func TestCreateImagePost_QuotePostNotMistakenForRegular(t *testing.T) {
 
 // TestCreateImagePost_RecoversRootByTopicTag covers the non-reply image case
 // where two posts in the recovery window share the same text and differ only
-// by topic_tag. The matcher must use topic_tag as a disambiguator (parity
-// with makeTextMatcher), not fail closed.
+// by topic_tag.
 func TestCreateImagePost_RecoversRootByTopicTag(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -364,10 +505,6 @@ func TestCreateImagePost_RecoversRootByTopicTag(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// Two non-reply image posts with identical captions. The one
-			// with the matching topic_tag must be selected — without
-			// topic_tag in the matcher, both would match and recovery
-			// would fail closed.
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
                 {"id":"wrong_topic_post","media_type":"IMAGE","is_reply":false,"text":"sunset","topic_tag":"OtherTopic"},
@@ -393,11 +530,9 @@ func TestCreateImagePost_RecoversRootByTopicTag(t *testing.T) {
 }
 
 // TestCreateImagePost_RecoversRootByText covers the non-reply image case
-// where we match on exact text equality. A different post with different
-// text in the recovery window must NOT be picked. No topic_tag is set,
-// confirming that empty-tag matches empty-tag.
+// where text is set but topic_tag is empty. Empty-tag matches empty-tag.
 func TestCreateImagePost_RecoversRootByText(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -434,12 +569,10 @@ func TestCreateImagePost_RecoversRootByText(t *testing.T) {
 }
 
 // TestCreateTextPost_RecoversAfterCode10 covers the text-post recovery path
-// end-to-end. Specifically, it exercises makeTextMatcher's TopicTag arm: two
-// posts in the recovery window share the same text but only one has our
-// topic_tag, so the matcher must disambiguate on TopicTag rather than just
-// returning the first text-match it encounters.
+// end-to-end. Two same-text posts share the recovery window and only differ
+// by topic_tag.
 func TestCreateTextPost_RecoversAfterCode10(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -452,8 +585,6 @@ func TestCreateTextPost_RecoversAfterCode10(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// Two non-reply text posts with identical text — only the
-			// matching topic_tag should disambiguate them.
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
                 {"id":"wrong_topic_post","media_type":"TEXT_POST","is_reply":false,"text":"daily standup","topic_tag":"OtherTopic"},
@@ -478,8 +609,8 @@ func TestCreateTextPost_RecoversAfterCode10(t *testing.T) {
 }
 
 // TestRecovery_NotTriggeredForNonCode10 verifies recovery is gated on the
-// code-10 pattern. For other publish failures (e.g. validation error code
-// 100), recovery must NOT issue the /me/threads lookup — that lookup is the
+// code-10 pattern. For other publish failures (e.g. validation code 100),
+// recovery must NOT issue extra Meta calls — the /me/threads lookup is the
 // signal that recovery actually fired.
 func TestRecovery_NotTriggeredForNonCode10(t *testing.T) {
 	var threadsListCalls int32
@@ -487,19 +618,15 @@ func TestRecovery_NotTriggeredForNonCode10(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
-			// Validation error (code 100), not the ambiguous publish pattern.
 			w.WriteHeader(400)
 			_, _ = w.Write([]byte(`{"error":{"message":"Param creation_id must be a number","type":"THApiException","code":100,"fbtrace_id":"test"}}`))
 		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"id":"image_container"}`))
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/image_container"):
-			// Container is ready for publish (FINISHED is the expected
-			// state at this point in the flow).
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"id":"image_container","status":"FINISHED"}`))
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
-			// If this is hit, recovery erroneously fired for non-code-10.
 			atomic.AddInt32(&threadsListCalls, 1)
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[]}`))
@@ -521,11 +648,12 @@ func TestRecovery_NotTriggeredForNonCode10(t *testing.T) {
 	}
 }
 
-// TestRecovery_NotRecoveredErrorSurfacesOriginal verifies that when
-// recovery is attempted but fails to find a matching post, the caller-facing
-// path surfaces the original publish error — not errPublishNotRecovered.
+// TestRecovery_NotRecoveredErrorSurfacesOriginal verifies that when recovery
+// is attempted but fails to find a matching post (after exhausting list
+// polls), the caller-facing path surfaces the original publish error —
+// not errPublishNotRecovered.
 func TestRecovery_NotRecoveredErrorSurfacesOriginal(t *testing.T) {
-	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	containerStatus, _ := containerStatusHandler(0, "PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -539,7 +667,7 @@ func TestRecovery_NotRecoveredErrorSurfacesOriginal(t *testing.T) {
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
 			w.WriteHeader(200)
-			_, _ = w.Write([]byte(`{"data":[]}`)) // no matches
+			_, _ = w.Write([]byte(`{"data":[]}`)) // never indexed
 		default:
 			http.NotFound(w, r)
 		}

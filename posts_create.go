@@ -206,7 +206,7 @@ func (c *Client) CreateCarouselPost(ctx context.Context, content *CarouselPostCo
 	publishStart := time.Now()
 	post, err := c.publishContainer(ctx, containerID)
 	if err != nil {
-		if recovered, recErr := c.recoverFromPublishError(ctx, containerID, publishStart, err, makeCarouselMatcher(content.Children)); recErr == nil {
+		if recovered, recErr := c.recoverFromPublishError(ctx, containerID, publishStart, err, makeCarouselMatcher(content)); recErr == nil {
 			return recovered, nil
 		}
 		return nil, fmt.Errorf("failed to publish carousel post: %w", err)
