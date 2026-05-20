@@ -152,46 +152,73 @@ func makeCarouselMatcher(childContainerIDs []string) publishMatcher {
 }
 
 // makeImageMatcher returns a matcher for a single-image post. For replies,
-// match strictly by parent post ID (which is unique within the recovery
-// window for posts from this user). For non-replies, match by exact text +
-// media type + non-reply state. The image URL stored on the post is Meta's
-// CDN URL, not ours, so we don't compare it.
+// parent ID alone is not unique — a caller can legitimately publish multiple
+// replies to the same parent, and clock skew or propagation delay could put
+// a prior reply inside the recovery window. So for replies we additionally
+// require exact text equality or a matching quoted-post target; blank-text
+// non-quote replies fail closed because they have no unique signal. For
+// non-replies, exact text + non-reply state is the disambiguator. The image
+// URL stored on the post is Meta's CDN URL, not ours, so we don't compare it.
 func makeImageMatcher(content *ImagePostContent) publishMatcher {
 	return func(p *Post) bool {
 		if p.MediaType != MediaTypeImage {
 			return false
 		}
-		if content.ReplyTo != "" {
-			return p.IsReply && repliedToID(p) == content.ReplyTo
+		if !quoteMatches(p, content.QuotedPostID) {
+			return false
 		}
-		return !p.IsReply && p.Text == content.Text
+		if content.ReplyTo == "" {
+			return !p.IsReply && p.Text == content.Text
+		}
+		if !p.IsReply || repliedToID(p) != content.ReplyTo {
+			return false
+		}
+		if !replyHasUniqueDiscriminator(content.Text, content.QuotedPostID) {
+			return false
+		}
+		return p.Text == content.Text
 	}
 }
 
 // makeVideoMatcher mirrors makeImageMatcher for video posts. After publish,
 // Meta may report video posts as media_type == "VIDEO" or "AUDIO" (for
-// audio-only uploads). Accept either.
+// audio-only uploads). Accept either. The same reply-uniqueness rules apply:
+// blank-text non-quote replies fail closed.
 func makeVideoMatcher(content *VideoPostContent) publishMatcher {
 	return func(p *Post) bool {
 		if p.MediaType != MediaTypeVideo && p.MediaType != MediaTypeAudio {
 			return false
 		}
-		if content.ReplyTo != "" {
-			return p.IsReply && repliedToID(p) == content.ReplyTo
+		if !quoteMatches(p, content.QuotedPostID) {
+			return false
 		}
-		return !p.IsReply && p.Text == content.Text
+		if content.ReplyTo == "" {
+			return !p.IsReply && p.Text == content.Text
+		}
+		if !p.IsReply || repliedToID(p) != content.ReplyTo {
+			return false
+		}
+		if !replyHasUniqueDiscriminator(content.Text, content.QuotedPostID) {
+			return false
+		}
+		return p.Text == content.Text
 	}
 }
 
-// makeTextMatcher returns a matcher for a text-only post. Replies match by
-// parent ID + text. Non-replies match by text + topic tag (the topic tag
-// disambiguates same-text posts across different topics).
+// makeTextMatcher returns a matcher for a text-only post. Text posts always
+// have non-empty text (validated upstream), so text equality is itself a
+// strong discriminator. Quote state must match in both directions, and
+// non-replies additionally compare topic_tag to disambiguate same-text posts
+// across different topics.
 func makeTextMatcher(content *TextPostContent) publishMatcher {
 	wantTextType := MediaTypeResponseText
 	return func(p *Post) bool {
-		// Some text post variants may come back as TEXT_POST or omit
-		// media_type entirely. Accept both shapes.
+		// Some text post variants come back as TEXT_POST or omit media_type
+		// entirely. Accept both shapes.
 		if p.MediaType != "" && p.MediaType != wantTextType && p.MediaType != MediaTypeText {
+			return false
+		}
+		if !quoteMatches(p, content.QuotedPostID) {
 			return false
 		}
 		if p.Text != content.Text {
@@ -202,6 +229,28 @@ func makeTextMatcher(content *TextPostContent) publishMatcher {
 		}
 		return !p.IsReply && p.TopicTag == content.TopicTag
 	}
+}
+
+// quoteMatches reports whether a retrieved post's quote state aligns with
+// what the caller asked for. wantQuotedID == "" means "must not be a quote
+// post"; non-empty means "must be a quote of that specific post". Matching
+// across the quote/non-quote boundary would let a regular post masquerade as
+// a quote post (or vice-versa) during recovery.
+func quoteMatches(p *Post, wantQuotedID string) bool {
+	if wantQuotedID == "" {
+		return !p.IsQuotePost
+	}
+	if !p.IsQuotePost || p.QuotedPost == nil {
+		return false
+	}
+	return p.QuotedPost.ID == wantQuotedID
+}
+
+// replyHasUniqueDiscriminator reports whether the (text, quotedPostID) pair
+// is strong enough to single out one reply among potentially many to the
+// same parent. Without one of these signals we'd be guessing.
+func replyHasUniqueDiscriminator(text, quotedPostID string) bool {
+	return text != "" || quotedPostID != ""
 }
 
 // repliedToID returns the parent post ID for a reply, preferring the

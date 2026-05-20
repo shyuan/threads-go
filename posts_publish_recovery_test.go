@@ -215,10 +215,10 @@ func TestCreateCarouselPost_FailClosedOnMultipleMatches(t *testing.T) {
 	}
 }
 
-// TestCreateImagePost_RecoversReplyByParentID covers the single-image reply
-// case. Replies are uniquely identified by parent post ID, so matching by
-// reply_to is safe even under concurrent publishes.
-func TestCreateImagePost_RecoversReplyByParentID(t *testing.T) {
+// TestCreateImagePost_RecoversReplyByParentIDAndText covers the single-image
+// reply case where the caller supplies non-empty text. Parent ID alone is
+// not unique across replies, so the matcher also requires text equality.
+func TestCreateImagePost_RecoversReplyByParentIDAndText(t *testing.T) {
 	containerStatus, _ := containerStatusHandler("PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -232,10 +232,11 @@ func TestCreateImagePost_RecoversReplyByParentID(t *testing.T) {
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
 			containerStatus(w, r)
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			// Two replies to the same parent, only one matches our text:
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"data":[
-                {"id":"recovered_reply","media_type":"IMAGE","is_reply":true,"reply_to":"parent_post_id"},
-                {"id":"unrelated_root_post","media_type":"IMAGE","is_reply":false}
+                {"id":"earlier_reply","media_type":"IMAGE","is_reply":true,"reply_to":"parent_post_id","text":"earlier comment"},
+                {"id":"recovered_reply","media_type":"IMAGE","is_reply":true,"reply_to":"parent_post_id","text":"the comment we just sent"}
             ]}`))
 		default:
 			http.NotFound(w, r)
@@ -246,12 +247,96 @@ func TestCreateImagePost_RecoversReplyByParentID(t *testing.T) {
 	post, err := client.CreateImagePost(context.Background(), &ImagePostContent{
 		ImageURL: "https://example.com/img.jpg",
 		ReplyTo:  "parent_post_id",
+		Text:     "the comment we just sent",
 	})
 	if err != nil {
 		t.Fatalf("expected recovery for image reply, got: %v", err)
 	}
 	if post == nil || post.ID != "recovered_reply" {
 		t.Fatalf("expected recovered_reply, got %#v", post)
+	}
+}
+
+// TestCreateImagePost_BlankTextReplyFailsClosed verifies that an image reply
+// with no text and no quoted post — which has no unique discriminator beyond
+// parent ID — does NOT recover, even if a prior reply to the same parent is
+// visible in the recovery window. This protects callers (e.g. chained reply
+// flows) from threading subsequent work off the wrong post ID.
+func TestCreateImagePost_BlankTextReplyFailsClosed(t *testing.T) {
+	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test"}}`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"id":"the_container"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
+			containerStatus(w, r)
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			// A prior reply to the same parent. Without a discriminator,
+			// matching by reply_to alone would WRONGLY return this post.
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"data":[
+                {"id":"prior_reply","media_type":"IMAGE","is_reply":true,"reply_to":"parent_post_id","text":""}
+            ]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(handler))
+	_, err := client.CreateImagePost(context.Background(), &ImagePostContent{
+		ImageURL: "https://example.com/img.jpg",
+		ReplyTo:  "parent_post_id",
+		// Text and QuotedPostID both empty — no unique signal.
+	})
+	if err == nil {
+		t.Fatal("expected fail-closed for blank-text non-quote image reply (would otherwise return prior_reply)")
+	}
+	if !strings.Contains(err.Error(), "threads api error 10") {
+		t.Errorf("expected original code 10 error to surface, got: %v", err)
+	}
+}
+
+// TestCreateImagePost_QuotePostNotMistakenForRegular verifies the quote-state
+// gate: if the caller asked for a non-quote image but a same-text quote post
+// shows up in the recovery window, the matcher must NOT pick it.
+func TestCreateImagePost_QuotePostNotMistakenForRegular(t *testing.T) {
+	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test"}}`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"id":"the_container"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
+			containerStatus(w, r)
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			// Same text, but it's a quote post — we asked for a regular
+			// post, so it must NOT match.
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"data":[
+                {"id":"a_quote_post","media_type":"IMAGE","is_reply":false,"text":"hello","is_quote_post":true,"quoted_post":{"id":"some_other_post"}}
+            ]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(handler))
+	_, err := client.CreateImagePost(context.Background(), &ImagePostContent{
+		Text:     "hello",
+		ImageURL: "https://example.com/img.jpg",
+		// No QuotedPostID → must only match non-quote posts.
+	})
+	if err == nil {
+		t.Fatal("expected fail-closed when only candidate is a quote post and caller asked for non-quote")
 	}
 }
 
