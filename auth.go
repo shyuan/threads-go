@@ -469,12 +469,25 @@ func (c *Client) DebugToken(ctx context.Context, inputToken string) (*DebugToken
 		inputToken = accessToken
 	}
 
-	params := url.Values{
-		"input_token":  {inputToken},
-		"access_token": {accessToken},
+	// Meta's /debug_token expects an app access token (TH|<APP_ID>|<APP_SECRET>)
+	// as the caller. For apps in Development mode, passing a user token here
+	// fails with error code 100 ("The app associated with this request is in
+	// dev mode") even when the user has a role on the app, because Meta
+	// resolves the request's app context from the caller token and enforces
+	// dev-mode role checks against that. Fall back to the user token only if
+	// ClientID/ClientSecret aren't configured, to preserve behavior for
+	// callers that don't supply them.
+	callerToken := c.GetAppAccessTokenShorthand()
+	if callerToken == "" {
+		callerToken = accessToken
 	}
 
-	resp, err := c.httpClient.GET("/debug_token", params, accessToken)
+	params := url.Values{
+		"input_token":  {inputToken},
+		"access_token": {callerToken},
+	}
+
+	resp, err := c.httpClient.GET("/debug_token", params, callerToken)
 	if err != nil {
 		return nil, NewNetworkError(0, "Failed to debug token", err.Error(), true)
 	}
