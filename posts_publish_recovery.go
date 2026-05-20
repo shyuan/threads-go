@@ -157,8 +157,10 @@ func makeCarouselMatcher(childContainerIDs []string) publishMatcher {
 // a prior reply inside the recovery window. So for replies we additionally
 // require exact text equality or a matching quoted-post target; blank-text
 // non-quote replies fail closed because they have no unique signal. For
-// non-replies, exact text + non-reply state is the disambiguator. The image
-// URL stored on the post is Meta's CDN URL, not ours, so we don't compare it.
+// non-replies, exact text + topic_tag + non-reply state is the disambiguator
+// — topic_tag breaks ties between same-text posts across different topics,
+// matching makeTextMatcher's behavior. The image URL stored on the post is
+// Meta's CDN URL, not ours, so we don't compare it.
 func makeImageMatcher(content *ImagePostContent) publishMatcher {
 	return func(p *Post) bool {
 		if p.MediaType != MediaTypeImage {
@@ -168,7 +170,7 @@ func makeImageMatcher(content *ImagePostContent) publishMatcher {
 			return false
 		}
 		if content.ReplyTo == "" {
-			return !p.IsReply && p.Text == content.Text
+			return !p.IsReply && p.Text == content.Text && p.TopicTag == content.TopicTag
 		}
 		if !p.IsReply || repliedToID(p) != content.ReplyTo {
 			return false
@@ -183,7 +185,8 @@ func makeImageMatcher(content *ImagePostContent) publishMatcher {
 // makeVideoMatcher mirrors makeImageMatcher for video posts. After publish,
 // Meta may report video posts as media_type == "VIDEO" or "AUDIO" (for
 // audio-only uploads). Accept either. The same reply-uniqueness rules apply:
-// blank-text non-quote replies fail closed.
+// blank-text non-quote replies fail closed. Non-replies disambiguate on
+// text + topic_tag.
 func makeVideoMatcher(content *VideoPostContent) publishMatcher {
 	return func(p *Post) bool {
 		if p.MediaType != MediaTypeVideo && p.MediaType != MediaTypeAudio {
@@ -193,7 +196,7 @@ func makeVideoMatcher(content *VideoPostContent) publishMatcher {
 			return false
 		}
 		if content.ReplyTo == "" {
-			return !p.IsReply && p.Text == content.Text
+			return !p.IsReply && p.Text == content.Text && p.TopicTag == content.TopicTag
 		}
 		if !p.IsReply || repliedToID(p) != content.ReplyTo {
 			return false

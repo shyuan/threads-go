@@ -346,9 +346,56 @@ func TestCreateImagePost_QuotePostNotMistakenForRegular(t *testing.T) {
 	}
 }
 
+// TestCreateImagePost_RecoversRootByTopicTag covers the non-reply image case
+// where two posts in the recovery window share the same text and differ only
+// by topic_tag. The matcher must use topic_tag as a disambiguator (parity
+// with makeTextMatcher), not fail closed.
+func TestCreateImagePost_RecoversRootByTopicTag(t *testing.T) {
+	containerStatus, _ := containerStatusHandler("PUBLISHED")
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads_publish"):
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"Application does not have permission for this action","type":"THApiException","code":10,"fbtrace_id":"test"}}`))
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"id":"the_container"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/the_container"):
+			containerStatus(w, r)
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/12345/threads"):
+			// Two non-reply image posts with identical captions. The one
+			// with the matching topic_tag must be selected — without
+			// topic_tag in the matcher, both would match and recovery
+			// would fail closed.
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"data":[
+                {"id":"wrong_topic_post","media_type":"IMAGE","is_reply":false,"text":"sunset","topic_tag":"OtherTopic"},
+                {"id":"recovered_post","media_type":"IMAGE","is_reply":false,"text":"sunset","topic_tag":"GoldenHour"}
+            ]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(handler))
+	post, err := client.CreateImagePost(context.Background(), &ImagePostContent{
+		Text:     "sunset",
+		ImageURL: "https://example.com/img.jpg",
+		TopicTag: "GoldenHour",
+	})
+	if err != nil {
+		t.Fatalf("expected recovery via text+topic_tag match, got: %v", err)
+	}
+	if post == nil || post.ID != "recovered_post" {
+		t.Fatalf("expected recovered_post, got %#v", post)
+	}
+}
+
 // TestCreateImagePost_RecoversRootByText covers the non-reply image case
 // where we match on exact text equality. A different post with different
-// text in the recovery window must NOT be picked.
+// text in the recovery window must NOT be picked. No topic_tag is set,
+// confirming that empty-tag matches empty-tag.
 func TestCreateImagePost_RecoversRootByText(t *testing.T) {
 	containerStatus, _ := containerStatusHandler("PUBLISHED")
 	handler := func(w http.ResponseWriter, r *http.Request) {
