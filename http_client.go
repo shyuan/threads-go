@@ -394,6 +394,15 @@ func (h *HTTPClient) wrapNetworkError(err error) error {
 
 // isRetryableError determines if an error should trigger a retry
 func (h *HTTPClient) isRetryableError(err error) bool {
+	// Authentication errors are never retryable — the token is invalid and
+	// no amount of retrying will fix it. Guard this before the status-code
+	// check below: setErrorMetadata stores the HTTP status (e.g. 500 from
+	// graph.threads.net) on AuthenticationError's embedded BaseError, so the
+	// HTTPStatusCode >= 500 branch would otherwise re-enable retries.
+	if IsAuthenticationError(err) {
+		return false
+	}
+
 	// Rate limit errors are retry-able
 	if IsRateLimitError(err) {
 		return true

@@ -538,17 +538,20 @@ func NewClientWithToken(accessToken string, config *Config) (*Client, error) {
 		return client, nil
 	}
 
-	// debug_token failed — verify with /me as fallback
-	meResp, err := client.TestAPICall("GET", "/v1.0/me", map[string]string{"fields": "id"})
-	if err != nil {
-		// Both validation paths failed; surface the original debug_token error
-		return nil, fmt.Errorf("failed to validate token: %w", debugErr)
+	// debug_token failed — verify with /me as fallback. Call httpClient
+	// directly rather than TestAPICall (which is test-only infrastructure).
+	meResp, meErr := client.httpClient.GET("/v1.0/me", url.Values{"fields": {"id"}}, accessToken)
+	if meErr != nil {
+		return nil, fmt.Errorf("failed to validate token (debug_token: %v, /me: %w)", debugErr, meErr)
 	}
 
 	var me struct {
 		ID string `json:"id"`
 	}
-	if jsonErr := json.Unmarshal(meResp.Body, &me); jsonErr != nil || me.ID == "" {
+	if jsonErr := json.Unmarshal(meResp.Body, &me); jsonErr != nil {
+		return nil, fmt.Errorf("failed to parse /me response (debug_token also failed: %v): %w", debugErr, jsonErr)
+	}
+	if me.ID == "" {
 		return nil, fmt.Errorf("failed to validate token: %w", debugErr)
 	}
 
